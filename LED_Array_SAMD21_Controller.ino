@@ -26,7 +26,7 @@
 #include <Servo.h>
 
 // Version tracking - increment with each code change
-const String CODE_VERSION = "0.002";
+const String CODE_VERSION = "0.003";
 
 // Pin assignments based on schematic naming
 const int dacPin = A0;          // A0 (DAC) - amplified to Buck_DIM net
@@ -36,6 +36,7 @@ const int rxReadyPin = D1;      // D1 (RX_READY) - interrupt input
 const int txReadyPin = D3;      // D3 (TX_READY) - output to next device
 const int txPin = D6;           // D6 (TX) - Serial1 transmit
 const int rxPin = D7;           // D7 (RX) - Serial1 receive
+const int dacLedPin = D10;      // D10 (D10_LED) - DAC status LED
 
 // Device states
 enum DeviceState
@@ -77,9 +78,11 @@ void setup()
     // Initialize pins
     pinMode(dacPin, OUTPUT);
     pinMode(ledPin, OUTPUT);
+    pinMode(dacLedPin, OUTPUT);      // Initialize D10 LED pin
     pinMode(rxReadyPin, INPUT_PULLUP);
     pinMode(txReadyPin, OUTPUT);
     digitalWrite(txReadyPin, HIGH); // TX_READY idle high
+    digitalWrite(dacLedPin, LOW);   // Initialize DAC LED off
 
     // Initialize servo
     myServo.attach(pwmPin);
@@ -151,7 +154,7 @@ void loop()
     // Check for timeouts - only re-initialize if there's an actual problem
     if (isMasterDevice)
     {
-        // Only auto re-initialize in these problem scenarios:
+        // Only 5 in these problem scenarios:
         // 1. Stuck in initialization states for too long
         // 2. System never completed initial initialization
         bool shouldReinitialize = false;
@@ -664,9 +667,9 @@ bool validateCommand(String command)
     if (commandStr == "servo")
     {
         int angle = valueStr.toInt();
-        if (angle < 0 || angle > 180)
+        if (angle < 60 || angle > 120)
         {
-            Serial.println("ERROR: Servo angle must be 0-180 degrees");
+            Serial.println("ERROR: Servo angle must be 60-120 degrees");
             return false;
         }
     }
@@ -697,13 +700,13 @@ void printHelp()
     Serial.println(" - Specific device numbers");
     Serial.println("");
     Serial.println("Commands:");
-    Serial.println("  servo,angle - Set servo angle (0-180 degrees)");
+    Serial.println("  servo,angle - Set servo angle (60-120 degrees)");
     Serial.println("  dac,value   - Set DAC value (0-1023)");
     Serial.println("");
     Serial.println("Examples:");
     Serial.println("  002,servo,90  - Set device 2 servo to 90 degrees");
     Serial.println("  003,dac,512   - Set device 3 DAC to 512");
-    Serial.println("  000,servo,45  - Command ALL devices servo to 45 degrees");
+    Serial.println("  000,servo,75  - Command ALL devices servo to 75 degrees");
     Serial.println("");
     Serial.println("Special Commands:");
     Serial.println("  help   - Show this help");
@@ -756,7 +759,20 @@ void printDeviceStatus()
 // Simple control functions
 void setServo(int angle)
 {
-    angle = constrain(angle, 0, 180);
+    int originalAngle = angle;
+    angle = constrain(angle, 60, 120);
+    
+    // Log if angle was adjusted
+    if (originalAngle != angle && isMasterDevice && Serial)
+    {
+        Serial.print("INFO: Servo angle adjusted from ");
+        Serial.print(originalAngle);
+        Serial.print("° to ");
+        Serial.print(angle);
+        Serial.print("° (valid range: 60-120°)");
+        Serial.println();
+    }
+    
     myServo.write(angle);
 }
 
@@ -764,4 +780,6 @@ void setDAC(int value)
 {
     value = constrain(value, 0, 1023);
     analogWrite(dacPin, value);
+    
+    digitalWrite(dacLedPin, (value > 0) ? HIGH : LOW);
 }
