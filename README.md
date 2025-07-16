@@ -2,15 +2,16 @@
 
 Arduino sketch implementing a daisy-chained round-robin communication system for SEEEDuino XIAO (SAMD21) boards with DAC and servo control capabilities.
 
-**Current Version**: v0.002
+**Current Version**: v0.004
 
 ## Hardware Requirements
 - **SEEEDuino XIAO** (SAMD21 based)
 - **A0 (DAC)** → amplified to Buck_DIM net for LED control
-- **D2 (PWM)** → logic level converted to 5V SERVO net
+- **D2 (PWM)** → logic level converted to 5V SERVO net (60-120 degrees)
 - **D1 (RX_READY)** → interrupt input for receiving commands
 - **D3 (TX_READY)** → output to signal next device
 - **D6 (TX), D7 (RX)** → Serial1 communication to next/previous device
+- **D10** → User LED output (active during servo sweep, DAC > 0)
 
 ## Communication Architecture
 
@@ -21,15 +22,43 @@ Devices are daisy-chained: Master → Device2 → Device3 → ... → Master
 - **Master Device**: USB connected, sends commands via Serial Monitor
 - **Slave Devices**: Externally powered, relay and process commands
 
+### Initialization Process
+1. Device powers up and waits indefinitely for either:
+   - USB Serial connection (becomes Master)
+   - RX_READY signal (becomes Slave)
+2. Upon role determination:
+   - Performs servo sweep (60° → 120° → 90°)
+   - User LED active during sweep
+3. Master initiates chain discovery
+4. Brief delay ensures all devices ready
+
 ### State Machine
 - **INIT_WAITING**: Waiting for initialization command
 - **INIT_ACTIVE**: Processing initialization sequence  
 - **READY**: Ready for commands (master only)
 - **PROCESSING**: Master waiting for command to return
 
-## Command Protocol
+## Serial Protocol
 
-### Format: `deviceId,command,value`
+### Message Format
+All messages use prefixed format for easy parsing:
+
+#### System Messages
+- `VER:0.004` - Version information
+- `CMD:xxx` - Command being sent
+- `RCV:xxx` - Command received
+- `EOT` - End of transmission
+- `ERR:xxx` - Error messages
+- `WARN:xxx` - Warning messages
+- `INIT:xxx` - Initialization messages
+- `SRV:id:angle` - Servo position update
+- `DAC:id:value` - DAC value update
+
+#### User Interface Messages
+- `UI:xxx` - Human-readable messages
+- Filtered by GUI for display purposes
+
+### Command Format: `deviceId,command,value`
 
 ### Three Command Types:
 
@@ -48,63 +77,58 @@ Devices are daisy-chained: Master → Device2 → Device3 → ... → Master
 - **Target device only**: Processes command
 - **All devices**: Forward until returns to master
 - **Master**: Enters PROCESSING state until command returns
-- **Example**: `002,servo,45` - only device 2 servo to 45°
+- **Example**: `002,servo,90` - only device 2 servo to 90°
 
 ## Available Commands
 
 ### Device Control
-- `servo,angle` - Set servo angle (0-180 degrees)
+- `servo,angle` - Set servo angle (60-120 degrees)
 - `dac,value` - Set DAC output (0-1023)
+  - User LED active when DAC > 0
 
 ### System Commands  
 - `help` - Show command help and version
-- `status` - Show device status and version
+- `status` - Show device status
 - `reinit` - Manual re-initialization
+- `dnc` - Execute dance routine
 
-## Command Validation
+### Dance Routine
+The `dnc` command executes a coordinated servo movement sequence:
+1. Initial sequence (all devices):
+   - Move to 60° → 500ms delay
+   - Move to 90° → 500ms delay
+   - Move to 120° → 500ms delay
+2. Random sequence:
+   - 5 random positions (60-120°)
+   - 200ms delay between moves
+3. Features:
+   - Can be interrupted by any serial input
+   - Automatically resets to 90° when complete
+   - Input during dance is discarded
 
-### Device Range Validation
-- **Automatic validation**: Commands only sent to detected devices
-- **Range checking**: Device IDs must be 000 (all) or 001-totalDevices
-- **Clear error messages**: Shows valid device range when invalid ID used
-- **Initialization awareness**: Blocks commands until system ready
+## Error Handling
 
-### Error Examples
-```
-> 003,servo,90
-ERROR: Device 3 not found. Valid range: 000 (all), 001-2
+### Command Validation
+- **Format**: `ERR:FORMAT` - Invalid command format
+- **Device Range**: `ERR:ID_MAX:2` - Device ID out of range
+- **Value Range**: 
+  - `ERR:SERVO_RANGE` - Servo angle not 60-120
+  - `ERR:DAC_RANGE` - DAC value not 0-1023
 
-> 002,servo,90     // Before initialization
-ERROR: No devices detected yet. Wait for initialization to complete.
-```
+### System Errors
+- `ERR:BUSY` - System processing another command
+- `ERR:TIMEOUT` - Command round-trip timeout
+- `ERR:NO_DEVICES` - No devices detected
 
-## Auto-Recovery Features
-
-### Smart Auto Re-initialization
-- **Problem-based triggering**: Only re-initializes for actual issues
-- **Stuck initialization**: Triggers if stuck in init states >5 seconds
-- **Zero devices detected**: Triggers if no devices found after init
-- **Stable operation**: Does NOT re-initialize during normal waiting
-- **Hot-swap support**: Automatically detects device changes
-
-### Command Timeout Protection
-- **2.5 second timeout** for PROCESSING state
-- **Prevents hanging** on lost commands
-- **Automatic state recovery** returns to READY state
-
-## Version Tracking
-
-### Code Versioning
-- **Version display**: Shown at startup, help, and status
-- **Increment tracking**: Version number increases with each code change
-- **Multi-device consistency**: Ensure all devices run same version
-- **Debug assistance**: Easy identification of running code version
-
-### Version Commands
-```
-> help     // Shows version in help header
-> status   // Shows version in status header
-```
+## Features
+- **Smooth servo control** with speed limiting
+- **User LED feedback** for servo and DAC operations
+- **Robust initialization** with role detection
+- **Machine-readable protocol** for GUI integration
+- **Comprehensive error reporting**
+- **Auto-recovery** from chain issues
+- **Hot-swap support** with automatic detection
+- **Coordinated movement** routines (dance)
 
 ## Pin Mapping
 ```
@@ -112,50 +136,17 @@ A0  - DAC        D6  - TX
 D1  - RX_READY   D7  - RX  
 D2  - PWM        D8  - D8
 D3  - TX_READY   D9  - D9
-D4  - SDA        D10 - D10_LED
+D4  - SDA        D10 - User LED
 D5  - SCL
 ```
 
-## Usage Examples
-
-### Master Device (USB Connected)
+## Communication Example
 ```
-SAMD21 Controller v0.002 - Round Robin Master Started
-Starting device initialization sequence...
-Initialization complete. Total devices: 2
-Master entering READY state - waiting for Serial commands
-
-> help              // Show commands and version
-> status            // Show system status  
-> 000,servo,90      // All devices servo to 90°  
-> 002,dac,512       // Device 2 DAC to 512
-> 003,servo,45      // ERROR: Device 3 not found. Valid range: 000 (all), 001-2
-> reinit            // Re-discover devices
-```
-
-### Communication Flow Example
-```
-Master: "002,servo,90" → Device2 → Device3 → Master
-         ↓ ignores      ↓ processes ↓ ignores  ↓ "Command completed"
-```
-
-### Validation Examples
-```
-> 000,servo,90      ✅ Valid: Command all devices
-> 001,dac,512       ✅ Valid: Device 1 (master)
-> 002,servo,45      ✅ Valid: Device 2 exists
-> 003,servo,90      ❌ Invalid: Device 3 doesn't exist
-> 999,dac,100       ❌ Invalid: Device 999 doesn't exist
-```
-
-## Features
-- **Version tracking** with automatic display
-- **Device range validation** prevents invalid commands
-- **Interrupt-driven** communication (RX_READY pin)
-- **9600 baud** Serial1 daisy-chain communication  
-- **115200 baud** USB Serial Monitor interface
-- **Smart command validation** with helpful error messages
-- **Intelligent state machine** prevents command conflicts
-- **Problem-based auto-recovery** from chain issues
-- **Hot-swap device support** with automatic detection
-- **Comprehensive error reporting** with valid range display 
+VER:0.004
+UI:Master started
+UI:Type 'help' or 'status'
+CMD:002,servo,90
+RCV:002,servo,90
+SRV:2:90
+EOT
+``` 

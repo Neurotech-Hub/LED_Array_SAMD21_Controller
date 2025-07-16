@@ -26,7 +26,7 @@
 #include <Servo.h>
 
 // Version tracking - increment with each code change
-const String CODE_VERSION = "0.002";
+const String CODE_VERSION = "0.004";
 
 // Pin assignments based on schematic naming
 const int dacPin = A0;          // A0 (DAC) - amplified to Buck_DIM net
@@ -36,6 +36,7 @@ const int rxReadyPin = D1;      // D1 (RX_READY) - interrupt input
 const int txReadyPin = D3;      // D3 (TX_READY) - output to next device
 const int txPin = D6;           // D6 (TX) - Serial1 transmit
 const int rxPin = D7;           // D7 (RX) - Serial1 receive
+const int userLedPin = D10;     // D10 - User LED output
 
 // Device states
 enum DeviceState
@@ -66,11 +67,79 @@ unsigned long stateTimeout = 0;
 String pendingCommand = "";         // Track master's pending command
 unsigned long initCompleteTime = 0; // Track when initialization completed
 
-// Communication timeouts
+// Communication timeouts and delays
 const unsigned long SERIAL_TIMEOUT = 2000; // USB detection
 const unsigned long RX_TIMEOUT = 100;      // 100ms for receiving data
 const unsigned long CHAIN_TIMEOUT = 5000;  // 5s for chain break detection
-const unsigned long TX_DELAY = 10;         // 10ms before transmission
+const unsigned long TX_DELAY = 2;          // 2ms setup time for TX_READY signal
+const unsigned long TX_SETUP = 1;          // 1ms setup time before sending data
+
+// Servo control variables
+int currentServoPos = 90; // Track current position
+int targetServoPos = 90;  // Track target position
+unsigned long lastServoUpdate = 0;
+const unsigned long SERVO_UPDATE_INTERVAL = 20; // 20ms between position updates
+const int SERVO_SPEED = 3;                      // Degrees per update (lower = smoother but slower)
+
+void updateServo()
+{
+    // Only update at the specified interval
+    if (millis() - lastServoUpdate < SERVO_UPDATE_INTERVAL)
+    {
+        return;
+    }
+
+    // Move toward target position at controlled speed
+    if (currentServoPos < targetServoPos)
+    {
+        currentServoPos = min(currentServoPos + SERVO_SPEED, targetServoPos);
+        myServo.write(currentServoPos);
+    }
+    else if (currentServoPos > targetServoPos)
+    {
+        currentServoPos = max(currentServoPos - SERVO_SPEED, targetServoPos);
+        myServo.write(currentServoPos);
+    }
+
+    lastServoUpdate = millis();
+}
+
+void sweepServo()
+{
+    // Turn on user LED during sweep
+    digitalWrite(userLedPin, HIGH);
+
+    // Sweep to 120
+    setServo(120);
+    while (currentServoPos != 120)
+    {
+        updateServo();
+        delay(1); // Give other processes time to run
+    }
+
+    delay(250); // Pause at max
+
+    // Sweep to 60
+    setServo(60);
+    while (currentServoPos != 60)
+    {
+        updateServo();
+        delay(1); // Give other processes time to run
+    }
+
+    delay(250); // Pause at min
+
+    // Return to center (90)
+    setServo(90);
+    while (currentServoPos != 90)
+    {
+        updateServo();
+        delay(1); // Give other processes time to run
+    }
+
+    // Turn off user LED after sweep
+    digitalWrite(userLedPin, LOW);
+}
 
 void setup()
 {
@@ -79,44 +148,60 @@ void setup()
     pinMode(ledPin, OUTPUT);
     pinMode(rxReadyPin, INPUT_PULLUP);
     pinMode(txReadyPin, OUTPUT);
+    pinMode(userLedPin, OUTPUT);
     digitalWrite(txReadyPin, HIGH); // TX_READY idle high
+    digitalWrite(userLedPin, LOW);  // Start with user LED off
 
     // Initialize servo
     myServo.attach(pwmPin);
     myServo.write(90); // Center position
+    currentServoPos = 90;
+    targetServoPos = 90;
+    lastServoUpdate = millis();
 
     // Initialize DAC
     analogWrite(dacPin, 0);
 
-    // Check if we're the master device (USB connected)
-    delay(SERIAL_TIMEOUT); // devices need time to establish USB, looping for Serial is not reliable
-    Serial.begin(115200);
-
-    isMasterDevice = (Serial);
-
-    // Initialize Serial1 for device communication
+    // Initialize Serial1 for device communication first
     Serial1.begin(9600);
 
-    // Setup interrupt for RX_READY
+    // Setup interrupt for RX_READY before waiting for Serial
     attachInterrupt(digitalPinToInterrupt(rxReadyPin), onRxReadyInterrupt, FALLING);
+
+    // Initialize USB Serial
+    Serial.begin(115200);
+
+    // Reset RX trigger flag before waiting
+    rxReadyTriggered = false;
+
+    // Wait forever until either:
+    // 1. USB Serial connection (we're master)
+    // 2. RX_READY interrupt (we're slave)
+    while (true)
+    {
+        if (Serial)
+        {
+            isMasterDevice = true;
+            break;
+        }
+        if (rxReadyTriggered)
+        {
+            isMasterDevice = false;
+            break;
+        }
+        // Blink LED while waiting
+        digitalWrite(ledPin, (millis() / 500) % 2);
+    }
+
+    // Perform servo sweep to indicate role determination complete
+    sweepServo();
 
     if (isMasterDevice)
     {
         delay(1000); // Give other devices time to boot
-        Serial.print("SAMD21 Controller v");
-        Serial.print(CODE_VERSION);
-        Serial.println(" - Round Robin Master Started");
-        Serial.println("Starting device initialization sequence...");
-        Serial.println("Auto re-initialization enabled (5s timeout)");
-        Serial.println("");
-        Serial.println("=== Serial Monitor Commands ===");
-        Serial.println("Type 'help' for command list");
-        Serial.println("Type 'status' for device status");
-        Serial.println("Command format: deviceId,command,value");
-        Serial.println("Example: 002,servo,90");
-        Serial.println("Use 000 to command all devices");
-        Serial.println("===============================");
-        Serial.println("");
+        Serial.println("VER:" + CODE_VERSION);
+        Serial.println("UI:Master started");
+        Serial.println("UI:Type 'help' or 'status'");
 
         // Start initialization sequence
         startInitialization();
@@ -124,9 +209,11 @@ void setup()
     else
     {
         // Slave device - wait for initialization
-        Serial.print("SAMD21 Controller v");
-        Serial.print(CODE_VERSION);
-        Serial.println(" - Round Robin Slave Started");
+        if (Serial)
+        {
+            Serial.println("VER:" + CODE_VERSION);
+            Serial.println("UI:Slave started");
+        }
         currentState = INIT_WAITING;
     }
 
@@ -141,6 +228,9 @@ void loop()
         rxReadyTriggered = false;
         handleIncomingData();
     }
+
+    // Update servo position if needed
+    updateServo();
 
     // Master device: Handle Serial Monitor commands
     if (isMasterDevice && Serial.available())
@@ -161,21 +251,20 @@ void loop()
             millis() - lastActivity > CHAIN_TIMEOUT)
         {
             shouldReinitialize = true;
-            reason = "Stuck in initialization state";
+            reason = "TIMEOUT:INIT_STUCK";
         }
         else if (totalDevices == 0 && currentState == READY &&
                  millis() - lastActivity > CHAIN_TIMEOUT)
         {
             shouldReinitialize = true;
-            reason = "No devices detected after initialization";
+            reason = "TIMEOUT:NO_DEVICES";
         }
 
         if (shouldReinitialize)
         {
             if (Serial)
             {
-                Serial.print("Auto re-initialization triggered: ");
-                Serial.println(reason);
+                Serial.println("ERR:" + reason);
             }
             restartInitialization();
         }
@@ -191,8 +280,7 @@ void loop()
     {
         if (Serial)
         {
-            Serial.print("WARNING: Command timeout - resetting to READY state. Lost command: ");
-            Serial.println(pendingCommand);
+            Serial.println("ERR:TIMEOUT:CMD:" + pendingCommand);
         }
         currentState = READY;
         pendingCommand = "";
@@ -250,8 +338,30 @@ void handleIncomingData()
 
         if (receivedData.length() > 0)
         {
-            processReceivedData(receivedData);
-            lastActivity = millis();
+            // Parse command to check if it's an init command
+            Command cmd;
+            bool isInit = false;
+            if (parseCommand(receivedData, cmd))
+            {
+                isInit = (cmd.command == "init");
+            }
+
+            // For init commands, process first then forward
+            if (isInit)
+            {
+                processReceivedData(receivedData);
+                lastActivity = millis();
+            }
+            // For all other commands, forward first then process
+            else
+            {
+                if (!isMasterDevice)
+                {
+                    forwardCommand(receivedData);
+                }
+                processReceivedData(receivedData);
+                lastActivity = millis();
+            }
         }
     }
 }
@@ -261,19 +371,47 @@ void processReceivedData(String data)
     Command cmd;
     if (parseCommand(data, cmd))
     {
-        if (isMasterDevice && Serial)
+        // Master device handling
+        if (isMasterDevice)
         {
-            Serial.print("Received (State:");
-            Serial.print(currentState == INIT_WAITING ? "INIT_WAITING" : currentState == INIT_ACTIVE ? "INIT_ACTIVE"
-                                                                     : currentState == READY         ? "READY"
-                                                                                                     : "PROCESSING");
-            Serial.print("): ");
-            Serial.println(data);
+            Serial.println("RCV:" + data);
+
+            // Check if this is master's own command coming back
+            bool isMyCommandReturning = (currentState == PROCESSING && data == pendingCommand);
+
+            if (isMyCommandReturning)
+            {
+                // Master's command returned - exit PROCESSING state
+                currentState = READY;
+                pendingCommand = "";
+                Serial.println("EOT");
+                return;
+            }
         }
 
-        // Case 1: Handle initialization commands (000,init,XXX)
+        // Handle initialization commands (000,init,XXX)
         if (cmd.command == "init")
         {
+            // Master in READY state - completely ignore stray init commands
+            if (currentState == READY)
+            {
+                if (isMasterDevice && Serial)
+                {
+                    Serial.println("WARN:STRAY_INIT");
+                }
+                return; // Don't process or forward
+            }
+
+            // Master in PROCESSING state - ignore init commands
+            if (currentState == PROCESSING)
+            {
+                if (isMasterDevice && Serial)
+                {
+                    Serial.println("WARN:BUSY");
+                }
+                return; // Don't process or forward
+            }
+
             if (currentState == INIT_WAITING)
             {
                 // Slave device: increment and forward
@@ -287,11 +425,9 @@ void processReceivedData(String data)
 
                 if (isMasterDevice && Serial)
                 {
-                    Serial.print("Device initialized as ID: ");
-                    Serial.println(myDeviceId);
+                    Serial.println("INIT:DEV:" + String(myDeviceId));
                 }
 
-                // Slave has processed and forwarded - don't forward again
                 return;
             }
             else if (isMasterDevice && currentState == INIT_ACTIVE)
@@ -304,39 +440,19 @@ void processReceivedData(String data)
 
                 if (Serial)
                 {
-                    Serial.print("Initialization complete. Total devices: ");
-                    Serial.println(totalDevices);
-                    Serial.println("Master entering READY state - waiting for Serial commands");
+                    Serial.println("INIT:TOTAL:" + String(totalDevices));
+                    delay(1000);
+                    Serial.println("UI:Ready for commands");
                 }
 
-                // Master has completed initialization - don't forward
                 return;
-            }
-            else if (isMasterDevice && currentState == READY)
-            {
-                // Master in READY state - completely ignore stray init commands
-                if (Serial)
-                {
-                    Serial.println("WARNING: Ignoring stray init command - system already initialized");
-                }
-                return; // Don't process or forward
-            }
-            else if (isMasterDevice && currentState == PROCESSING)
-            {
-                // Master in PROCESSING state - ignore init commands
-                if (Serial)
-                {
-                    Serial.println("WARNING: Ignoring init command while processing user command");
-                }
-                return; // Don't process or forward
             }
             else if (!isMasterDevice && currentState == READY)
             {
                 // Slave in READY state receiving init command - this means re-initialization
-                // Reset to INIT_WAITING and process normally
                 if (Serial)
                 {
-                    Serial.println("Slave resetting for re-initialization");
+                    Serial.println("INIT:RESET");
                 }
                 currentState = INIT_WAITING;
                 myDeviceId = 0; // Reset device ID
@@ -356,7 +472,7 @@ void processReceivedData(String data)
             // This point should never be reached for init commands
             if (Serial)
             {
-                Serial.println("ERROR: Unhandled init command state");
+                Serial.println("ERR:UNKNOWN_STATE");
             }
             return;
         }
@@ -366,40 +482,17 @@ void processReceivedData(String data)
         {
             if (isMasterDevice && Serial)
             {
-                Serial.print("WARNING: Ignoring non-init command during initialization: ");
-                Serial.println(data);
+                Serial.println("WARN:NOT_READY:" + data);
             }
             return;
         }
 
-        // Check if this is master's own command coming back
-        bool isMyCommandReturning = (isMasterDevice && currentState == PROCESSING && data == pendingCommand);
-
-        if (isMyCommandReturning)
-        {
-            // Master's command returned - exit PROCESSING state
-            currentState = READY;
-            pendingCommand = "";
-
-            if (Serial)
-            {
-                Serial.println("Command completed round trip - returning to READY state");
-            }
-        }
-
-        // Case 2 & 3: Handle servo/dac commands
-        // Process command if it's for this device (specific ID) or all devices (000)
-        if (cmd.deviceId == myDeviceId || cmd.deviceId == 0)
+        // Process command if:
+        // 1. It's a broadcast command (000)
+        // 2. OR it's specifically for this device
+        if (cmd.deviceId == 0 || cmd.deviceId == myDeviceId)
         {
             processCommand(cmd);
-        }
-
-        // Forward logic:
-        // - Slaves always forward (except init commands handled above)
-        // - Master only forwards if NOT its own command returning
-        if (!isMasterDevice || !isMyCommandReturning)
-        {
-            forwardCommand(data);
         }
     }
 }
@@ -430,10 +523,7 @@ void processCommand(Command &cmd)
 
         if (isMasterDevice && Serial)
         {
-            Serial.print("Device ");
-            Serial.print(myDeviceId);
-            Serial.print(" servo set to: ");
-            Serial.println(angle);
+            Serial.println("SRV:" + String(myDeviceId) + ":" + String(angle));
         }
     }
     else if (cmd.command == "dac")
@@ -443,23 +533,23 @@ void processCommand(Command &cmd)
 
         if (isMasterDevice && Serial)
         {
-            Serial.print("Device ");
-            Serial.print(myDeviceId);
-            Serial.print(" DAC set to: ");
-            Serial.println(value);
+            Serial.println("DAC:" + String(myDeviceId) + ":" + String(value));
         }
     }
 }
 
 void forwardCommand(String data)
 {
-    // Signal next device
+    // Signal next device with proper setup time
     digitalWrite(txReadyPin, LOW);
-    delay(TX_DELAY);
+    delay(TX_SETUP); // Give receiving device time to prepare
 
     // Send data
     Serial1.println(data);
     Serial1.flush();
+
+    // Hold signal for minimum time
+    delay(TX_DELAY);
 
     // Release signal
     digitalWrite(txReadyPin, HIGH);
@@ -479,11 +569,7 @@ void restartInitialization()
 {
     if (Serial)
     {
-        Serial.print("=== Re-initializing Device Chain v");
-        Serial.print(CODE_VERSION);
-        Serial.println(" ===");
-        Serial.print("Previous device count: ");
-        Serial.println(totalDevices);
+        Serial.println("INIT:RESTART:PREV_COUNT:" + String(totalDevices));
     }
 
     // Reset device state
@@ -502,8 +588,7 @@ void restartInitialization()
 
     if (Serial)
     {
-        Serial.println("Re-initialization command sent");
-        Serial.println("===================================");
+        Serial.println("INIT:RESTART:SENT");
     }
 }
 
@@ -520,6 +605,42 @@ void sendTestCommand()
             Serial.println("Sent test command to device 2");
         }
     }
+}
+
+void danceRoutine()
+{
+    if (!isMasterDevice)
+        return; // Only master can initiate dance
+
+    Serial.println("UI:Dance started");
+
+    // Initial sequence
+    sendCommandAndWait("000,servo,60");
+    delay(500);
+    sendCommandAndWait("000,servo,90");
+    delay(500);
+    sendCommandAndWait("000,servo,120");
+    delay(500);
+
+    // Random dance for 5 iterations or until serial input
+    for (int i = 0; i < 5 && !Serial.available(); i++)
+    {
+        int randomAngle = random(60, 121); // Random angle between 60-120
+        sendCommandAndWait("000,servo," + String(randomAngle));
+        delay(200);
+    }
+
+    // Clear any pending serial input
+    while (Serial.available())
+    {
+        Serial.read();
+    }
+
+    // Reset all servos to center
+    sendCommandAndWait("000,servo,90");
+    delay(200);
+
+    Serial.println("UI:Dance complete");
 }
 
 void handleSerialCommand()
@@ -549,8 +670,15 @@ void handleSerialCommand()
     // Manual re-initialization if user types "reinit"
     if (input.equalsIgnoreCase("reinit"))
     {
-        Serial.println("Manual re-initialization requested");
+        Serial.println("UI:Manual re-initialization requested");
         restartInitialization();
+        return;
+    }
+
+    // Dance routine if user types "dnc"
+    if (input.equalsIgnoreCase("dnc"))
+    {
+        danceRoutine();
         return;
     }
 
@@ -560,12 +688,11 @@ void handleSerialCommand()
         // Check if master is already processing a command
         if (currentState == PROCESSING)
         {
-            Serial.println("ERROR: Master is processing another command. Wait for completion.");
+            Serial.println("ERR:BUSY");
             return;
         }
 
-        Serial.print("Sending command: ");
-        Serial.println(input);
+        Serial.println("CMD:" + input);
 
         // Set master to PROCESSING state and track pending command
         currentState = PROCESSING;
@@ -576,19 +703,7 @@ void handleSerialCommand()
     }
     else
     {
-        Serial.println("ERROR: Invalid command format or parameters");
-        Serial.println("Use: deviceId,command,value");
-        Serial.println("Example: 002,servo,90");
-        if (totalDevices > 0)
-        {
-            Serial.print("Valid device IDs: 000 (all), 001-");
-            Serial.println(totalDevices);
-        }
-        else
-        {
-            Serial.println("System initializing - please wait...");
-        }
-        Serial.println("Type 'help' for more information");
+        Serial.println("UI:Type 'help' for valid commands");
     }
 }
 
@@ -601,6 +716,8 @@ bool validateCommand(String command)
 
     if (firstComma == -1 || secondComma == -1 || thirdComma != -1)
     {
+        if (Serial)
+            Serial.println("ERR:FORMAT");
         return false;
     }
 
@@ -612,6 +729,8 @@ bool validateCommand(String command)
     // Validate device ID (should be 3 digits)
     if (deviceIdStr.length() != 3)
     {
+        if (Serial)
+            Serial.println("ERR:ID_LEN");
         return false;
     }
 
@@ -619,6 +738,8 @@ bool validateCommand(String command)
     {
         if (!isDigit(deviceIdStr[i]))
         {
+            if (Serial)
+                Serial.println("ERR:ID_NUM");
             return false;
         }
     }
@@ -626,37 +747,39 @@ bool validateCommand(String command)
     int deviceId = deviceIdStr.toInt();
     if (deviceId < 0 || deviceId > 999)
     {
+        if (Serial)
+            Serial.println("ERR:ID_RANGE");
         return false;
     }
 
     // Validate device ID is within detected device range
     if (totalDevices == 0)
     {
-        Serial.println("ERROR: No devices detected yet. Wait for initialization to complete.");
+        if (Serial)
+            Serial.println("ERR:NO_DEVICES");
         return false;
     }
 
     if (deviceId > 0 && deviceId > totalDevices)
     {
-        Serial.print("ERROR: Device ");
-        Serial.print(deviceId);
-        Serial.print(" not found. Valid range: 000 (all), 001-");
-        Serial.println(totalDevices);
+        if (Serial)
+            Serial.println("ERR:ID_MAX:" + String(totalDevices));
         return false;
     }
 
     // Validate command string (should not be empty)
     if (commandStr.length() == 0)
     {
+        if (Serial)
+            Serial.println("ERR:CMD_EMPTY");
         return false;
     }
 
     // Validate known commands
     if (commandStr != "servo" && commandStr != "dac" && commandStr != "init")
     {
-        Serial.print("WARNING: Unknown command '");
-        Serial.print(commandStr);
-        Serial.println("'. Valid commands: servo, dac, init");
+        if (Serial)
+            Serial.println("WARN:CMD_UNKNOWN:" + commandStr);
         // Allow it to proceed anyway for future extensibility
     }
 
@@ -664,9 +787,10 @@ bool validateCommand(String command)
     if (commandStr == "servo")
     {
         int angle = valueStr.toInt();
-        if (angle < 0 || angle > 180)
+        if (angle < 60 || angle > 120)
         {
-            Serial.println("ERROR: Servo angle must be 0-180 degrees");
+            if (Serial)
+                Serial.println("ERR:SERVO_RANGE");
             return false;
         }
     }
@@ -675,7 +799,8 @@ bool validateCommand(String command)
         int value = valueStr.toInt();
         if (value < 0 || value > 1023)
         {
-            Serial.println("ERROR: DAC value must be 0-1023");
+            if (Serial)
+                Serial.println("ERR:DAC_RANGE");
             return false;
         }
     }
@@ -685,83 +810,77 @@ bool validateCommand(String command)
 
 void printHelp()
 {
-    Serial.print("=== SAMD21 Round Robin Controller v");
-    Serial.print(CODE_VERSION);
-    Serial.println(" Help ===");
-    Serial.println("Command Format: deviceId,command,value");
-    Serial.println("");
-    Serial.println("Device IDs:");
-    Serial.println("  000 - Command all devices");
-    Serial.print("  001-");
-    Serial.print(totalDevices, DEC);
-    Serial.println(" - Specific device numbers");
-    Serial.println("");
-    Serial.println("Commands:");
-    Serial.println("  servo,angle - Set servo angle (0-180 degrees)");
-    Serial.println("  dac,value   - Set DAC value (0-1023)");
-    Serial.println("");
-    Serial.println("Examples:");
-    Serial.println("  002,servo,90  - Set device 2 servo to 90 degrees");
-    Serial.println("  003,dac,512   - Set device 3 DAC to 512");
-    Serial.println("  000,servo,45  - Command ALL devices servo to 45 degrees");
-    Serial.println("");
-    Serial.println("Special Commands:");
-    Serial.println("  help   - Show this help");
-    Serial.println("  status - Show device status");
-    Serial.println("  reinit - Re-initialize device chain");
-    Serial.println("===========================================");
+    Serial.println("VER:" + CODE_VERSION);
+    Serial.println("FMT:deviceId,command,value");
+    Serial.println("DEV:000=all," + String(totalDevices) + "=max");
+    Serial.println("CMD:servo=60-120,dac=0-1023");
+    Serial.println("SYS:help,status,reinit,dnc");
 }
 
 void printDeviceStatus()
 {
-    Serial.print("=== Device Status v");
-    Serial.print(CODE_VERSION);
-    Serial.println(" ===");
-    Serial.print("Master Device ID: ");
-    Serial.println(myDeviceId);
-    Serial.print("Total Devices: ");
-    Serial.println(totalDevices);
-    Serial.print("Current State: ");
-
-    switch (currentState)
+    Serial.println("VER:" + CODE_VERSION);
+    Serial.println("ID:" + String(myDeviceId));
+    Serial.println("TOTAL:" + String(totalDevices));
+    Serial.println("STATE:" + String(currentState));
+    if (pendingCommand.length() > 0)
     {
-    case INIT_WAITING:
-        Serial.println("INIT_WAITING");
-        break;
-    case INIT_ACTIVE:
-        Serial.println("INIT_ACTIVE");
-        break;
-    case READY:
-        Serial.println("READY");
-        break;
-    case PROCESSING:
-        Serial.println("PROCESSING");
-        if (pendingCommand.length() > 0)
-        {
-            Serial.print("Pending command: ");
-            Serial.println(pendingCommand);
-        }
-        break;
-    default:
-        Serial.println("UNKNOWN");
-        break;
+        Serial.println("PENDING:" + pendingCommand);
     }
-
-    Serial.print("Last Activity: ");
-    Serial.print((millis() - lastActivity) / 1000);
-    Serial.println(" seconds ago");
-    Serial.println("====================");
+    Serial.println("LAST:" + String((millis() - lastActivity) / 1000));
 }
 
 // Simple control functions
+// Modified setServo to use smooth movement
 void setServo(int angle)
 {
-    angle = constrain(angle, 0, 180);
-    myServo.write(angle);
+    angle = constrain(angle, 60, 120);
+    targetServoPos = angle;
 }
 
 void setDAC(int value)
 {
     value = constrain(value, 0, 1023);
     analogWrite(dacPin, value);
+
+    // Control user LED based on DAC value
+    digitalWrite(userLedPin, value > 0 ? HIGH : LOW);
+}
+
+// Helper function to send command and wait for EOT
+void sendCommandAndWait(String command)
+{
+    if (Serial)
+    {
+        Serial.println("CMD:" + command);
+    }
+
+    // Set master to PROCESSING state and track pending command
+    currentState = PROCESSING;
+    pendingCommand = command;
+
+    forwardCommand(command);
+    lastActivity = millis();
+
+    // Wait for command to complete (EOT)
+    while (currentState == PROCESSING)
+    {
+        if (rxReadyTriggered)
+        {
+            rxReadyTriggered = false;
+            handleIncomingData();
+        }
+
+        // Check for timeout
+        if (millis() - lastActivity > (CHAIN_TIMEOUT / 2))
+        {
+            if (Serial)
+            {
+                Serial.println("ERR:TIMEOUT:" + pendingCommand);
+            }
+            currentState = READY;
+            pendingCommand = "";
+            break;
+        }
+    }
 }
