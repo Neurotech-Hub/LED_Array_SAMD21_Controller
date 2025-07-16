@@ -3,6 +3,9 @@
 
   This sketch implements a daisy-chained round-robin communication system
   for SEEEDuino XIAO boards with DAC and servo control capabilities.
+  
+  Features robust USB CDC handling with hardware fallback to prevent
+  system lockups when USB enumeration fails.
 
   Hardware:
   - SEEEDuino XIAO (SAMD21 based)
@@ -12,6 +15,7 @@
   - D3 (TX_READY) - output to signal next device
   - D6 (TX) - Serial1 transmit to next device
   - D7 (RX) - Serial1 receive from previous device
+
 
   Pin-Schematic Mapping:
   A0  - DAC        D6  - TX
@@ -26,7 +30,7 @@
 #include <Servo.h>
 
 // Version tracking - increment with each code change
-const String CODE_VERSION = "0.003";
+const String CODE_VERSION = "0.004";
 
 // Pin assignments based on schematic naming
 const int dacPin = A0;          // A0 (DAC) - amplified to Buck_DIM net
@@ -38,11 +42,13 @@ const int txPin = D6;           // D6 (TX) - Serial1 transmit
 const int rxPin = D7;           // D7 (RX) - Serial1 receive
 const int dacLedPin = D10;      // D10 (D10_LED) - DAC status LED
 
+
 // Device states
 enum DeviceState
 {
     INIT_WAITING, // Waiting for initialization
     INIT_ACTIVE,  // Processing initialization
+    WAKEUP,       // Woken up early, ready for actual initialization
     READY,        // Ready for commands
     PROCESSING    // Processing a command
 };
@@ -53,6 +59,7 @@ struct Command
     int deviceId;
     String command;
     String value;
+    String commandId;
 };
 
 // Global variables
@@ -75,12 +82,13 @@ const unsigned long TX_DELAY = 10;         // 10ms before transmission
 
 void setup()
 {
-    // Initialize pins
+    // Initialize pins first - critical for system stability
     pinMode(dacPin, OUTPUT);
     pinMode(ledPin, OUTPUT);
     pinMode(dacLedPin, OUTPUT);      // Initialize D10 LED pin
     pinMode(rxReadyPin, INPUT_PULLUP);
     pinMode(txReadyPin, OUTPUT);
+
     digitalWrite(txReadyPin, HIGH); // TX_READY idle high
     digitalWrite(dacLedPin, LOW);   // Initialize DAC LED off
 
@@ -91,48 +99,114 @@ void setup()
     // Initialize DAC
     analogWrite(dacPin, 0);
 
-    // Check if we're the master device (USB connected)
-    delay(SERIAL_TIMEOUT); // devices need time to establish USB, looping for Serial is not reliable
+    // Non-blocking USB CDC setup with robust fallback
     Serial.begin(115200);
 
-    isMasterDevice = (Serial);
-
-    // Initialize Serial1 for device communication
+    // Initialize Serial1 for device communication - critical for all devices
     Serial1.begin(9600);
+    
+    // Determine master status with timeout and fallback logic
+    bool usbAvailable = false;
+    bool earlyBreak = false;
+    unsigned long startTime = millis();
+    
+    // Try to detect USB CDC for 60 seconds (non-blocking)
+    while (millis() - startTime < 60000) { 
+        if (Serial) {
+            usbAvailable = true;
+            // Master detected USB - send wakeup signal to all slaves immediately
+            String wakeupCommand = "000,wakeup,master";
+            forwardCommand(wakeupCommand);
+            Serial.println("Wakeup command sent to all slaves");
+            delay(100);
+            break;
+        }
+        
+        if (Serial1.available()) {
+            String message = Serial1.readStringUntil('\n');
+            message.trim();
+            if (message == "000,wakeup,master") {
+                earlyBreak = true;
+                // Forward the wakeup signal to next device in the daisy-chain
+                Serial1.println(message);
+                Serial1.flush();
+                delay(100);
+                break;
+            }
+        }        
+        delay(100);
+    }
+    
+    // Master determination with multiple fallback methods
+    if (usbAvailable) {
+        // Primary method: USB CDC detected
+        isMasterDevice = true;
+        Serial.println("USB CDC detected - Master mode enabled");
+        Serial.print("SAMD21 Controller v");
+        Serial.print(CODE_VERSION);
+        Serial.println(" - USB Master initialization successful");
+        Serial.println("Wakeup signal sent to all slave devices");
+    } else if (earlyBreak) {
+        // Device received wakeup signal from master - must be a slave
+        isMasterDevice = false;
+        currentState = WAKEUP; // Set to WAKEUP state, ready for actual initialization
+        if (Serial) {
+            Serial.println("Wakeup signal received - Slave mode enabled");
+            Serial.print("SAMD21 Controller v");
+            Serial.print(CODE_VERSION);
+            Serial.println(" - Slave mode initialization (early wake-up)");
+        }
+    } else {
+        // Default to slave mode if no USB detected and no early break
+        isMasterDevice = false;
+        currentState = INIT_WAITING; // Still waiting for initialization
+        if (Serial) {
+            Serial.println("No USB detected - Slave mode enabled");
+            Serial.print("SAMD21 Controller v");
+            Serial.print(CODE_VERSION);
+            Serial.println(" - Slave mode initialization");
+        }
+    }
 
-    // Setup interrupt for RX_READY
+    // Setup interrupt for RX_READY - critical for all devices
     attachInterrupt(digitalPinToInterrupt(rxReadyPin), onRxReadyInterrupt, FALLING);
 
+    // Continue initialization regardless of USB status
     if (isMasterDevice)
     {
         delay(1000); // Give other devices time to boot
-        Serial.print("SAMD21 Controller v");
-        Serial.print(CODE_VERSION);
-        Serial.println(" - Round Robin Master Started");
-        Serial.println("Starting device initialization sequence...");
-        Serial.println("Auto re-initialization enabled (5s timeout)");
-        Serial.println("");
-        Serial.println("=== Serial Monitor Commands ===");
-        Serial.println("Type 'help' for command list");
-        Serial.println("Type 'status' for device status");
-        Serial.println("Command format: deviceId,command,value");
-        Serial.println("Example: 002,servo,90");
-        Serial.println("Use 000 to command all devices");
-        Serial.println("===============================");
-        Serial.println("");
+        
+        // Only print detailed info if USB is available
+        if (Serial) {
+            Serial.println("=== Round Robin Master Started ===");
+            Serial.println("Starting device initialization sequence...");
+            Serial.println("Auto re-initialization enabled (5s timeout)");
+            Serial.println("");
+            Serial.println("=== Serial Monitor Commands ===");
+            Serial.println("Type 'help' for command list");
+            Serial.println("Type 'status' for device status");
+            Serial.println("Command format: deviceId,command,value");
+            Serial.println("Example: 002,servo,90");
+            Serial.println("Use 000 to command all devices");
+            Serial.println("===============================");
+            Serial.println("");
+        }
 
-        // Start initialization sequence
+        // Start initialization sequence - works with or without USB
         startInitialization();
     }
     else
     {
-        // Slave device - wait for initialization
-        Serial.print("SAMD21 Controller v");
-        Serial.print(CODE_VERSION);
-        Serial.println(" - Round Robin Slave Started");
-        currentState = INIT_WAITING;
+        // Slave device - wait for initialization (state already set above)
+        if (Serial) {
+            Serial.print("SAMD21 Controller v");
+            Serial.print(CODE_VERSION);
+            Serial.println(" - Round Robin Slave Started");
+        }
+        // currentState already set above based on earlyBreak or not
     }
 
+    // Always set last activity regardless of USB status
     lastActivity = millis();
 }
 
@@ -154,19 +228,20 @@ void loop()
     // Check for timeouts - only re-initialize if there's an actual problem
     if (isMasterDevice)
     {
-        // Only 5 in these problem scenarios:
+        // Only auto re-initialize in these problem scenarios:
         // 1. Stuck in initialization states for too long
         // 2. System never completed initial initialization
         bool shouldReinitialize = false;
         String reason = "";
 
-        if ((currentState == INIT_WAITING || currentState == INIT_ACTIVE) &&
+        if ((currentState == INIT_WAITING || currentState == INIT_ACTIVE || currentState == WAKEUP) &&
             millis() - lastActivity > CHAIN_TIMEOUT)
         {
             shouldReinitialize = true;
             reason = "Stuck in initialization state";
         }
         else if (totalDevices == 0 && currentState == READY &&
+                 initCompleteTime == 0 && // Only if initialization never completed
                  millis() - lastActivity > CHAIN_TIMEOUT)
         {
             shouldReinitialize = true;
@@ -180,11 +255,12 @@ void loop()
                 Serial.print("Auto re-initialization triggered: ");
                 Serial.println(reason);
             }
-            restartInitialization();
+            restartInitialization();            
+            delay(1000); // Give other devices time to boot
         }
-        else if (millis() - lastActivity > CHAIN_TIMEOUT)
+        else if (currentState == READY && millis() - lastActivity > CHAIN_TIMEOUT)
         {
-            // Just reset the activity timer - no re-initialization needed
+            // In READY state with long inactivity - just reset timer, don't reinitialize
             lastActivity = millis();
         }
     }
@@ -196,6 +272,8 @@ void loop()
         {
             Serial.print("WARNING: Command timeout - resetting to READY state. Lost command: ");
             Serial.println(pendingCommand);
+            Serial.print("Current State: ");
+            Serial.println("READY");
         }
         currentState = READY;
         pendingCommand = "";
@@ -211,7 +289,6 @@ void loop()
     }
 
     // Master device periodic tasks - DISABLED for debugging
-    // Automatic test commands can interfere with initialization
     /*
     if (isMasterDevice && currentState == READY && totalDevices > 0)
     {
@@ -274,10 +351,31 @@ void processReceivedData(String data)
             Serial.println(data);
         }
 
+        // Handle wakeup commands first
+        if (cmd.command == "wakeup")
+        {
+            if (currentState == INIT_WAITING)
+            {
+                // Slave transitions from INIT_WAITING to WAKEUP
+                currentState = WAKEUP;
+                if (Serial)
+                {
+                    Serial.println("Wakeup command received - transitioning to WAKEUP state");
+                }
+            }
+            
+            // Always forward wakeup commands (except from master)
+            if (!isMasterDevice)
+            {
+                forwardCommand(data);
+            }
+            return;
+        }
+
         // Case 1: Handle initialization commands (000,init,XXX)
         if (cmd.command == "init")
         {
-            if (currentState == INIT_WAITING)
+            if (currentState == INIT_WAITING || currentState == WAKEUP)
             {
                 // Slave device: increment and forward
                 myDeviceId = cmd.value.toInt() + 1;
@@ -310,6 +408,8 @@ void processReceivedData(String data)
                     Serial.print("Initialization complete. Total devices: ");
                     Serial.println(totalDevices);
                     Serial.println("Master entering READY state - waiting for Serial commands");
+                    Serial.print("Current State: ");
+                    Serial.println("READY");
                 }
 
                 // Master has completed initialization - don't forward
@@ -365,7 +465,7 @@ void processReceivedData(String data)
         }
 
         // Ignore non-init commands during initialization
-        if (currentState == INIT_WAITING || currentState == INIT_ACTIVE)
+        if (currentState == INIT_WAITING || currentState == INIT_ACTIVE || currentState == WAKEUP)
         {
             if (isMasterDevice && Serial)
             {
@@ -380,14 +480,22 @@ void processReceivedData(String data)
 
         if (isMyCommandReturning)
         {
-            // Master's command returned - exit PROCESSING state
-            currentState = READY;
-            pendingCommand = "";
-
+            // Master's command returned - command completed round trip
             if (Serial)
             {
-                Serial.println("Command completed round trip - returning to READY state");
+                Serial.print("Command completed round trip: ");
+                Serial.println(pendingCommand);
+                Serial.println("Returning to READY state");
+                Serial.print("Current State: ");
+                Serial.println("READY");
             }
+            
+            // Exit PROCESSING state
+            currentState = READY;
+            pendingCommand = "";
+            lastActivity = millis();
+            
+            return;
         }
 
         // Case 2 & 3: Handle servo/dac commands
@@ -398,7 +506,7 @@ void processReceivedData(String data)
         }
 
         // Forward logic:
-        // - Slaves always forward (except init commands handled above)
+        // - Slaves always forward (except init commands and ACKs handled above)
         // - Master only forwards if NOT its own command returning
         if (!isMasterDevice || !isMyCommandReturning)
         {
@@ -433,9 +541,7 @@ void processCommand(Command &cmd)
 
         if (isMasterDevice && Serial)
         {
-            Serial.print("Device ");
-            Serial.print(myDeviceId);
-            Serial.print(" servo set to: ");
+            Serial.print("Master servo set to: ");
             Serial.println(angle);
         }
     }
@@ -446,9 +552,7 @@ void processCommand(Command &cmd)
 
         if (isMasterDevice && Serial)
         {
-            Serial.print("Device ");
-            Serial.print(myDeviceId);
-            Serial.print(" DAC set to: ");
+            Serial.print("Master DAC set to: ");
             Serial.println(value);
         }
     }
@@ -473,6 +577,12 @@ void startInitialization()
     currentState = INIT_ACTIVE;
     myDeviceId = 1; // Master is device 1
 
+    if (Serial)
+    {
+        Serial.print("Current State: ");
+        Serial.println("INIT_ACTIVE");
+    }
+
     // Send initialization command
     String initCommand = "000,init,001";
     forwardCommand(initCommand);
@@ -496,7 +606,6 @@ void restartInitialization()
     initCompleteTime = 0; // Reset initialization timer
     pendingCommand = "";  // Clear any pending commands
 
-    // Add longer delay to allow any stray commands to clear the system
     delay(1000);
 
     // Send initialization command
@@ -567,12 +676,18 @@ void handleSerialCommand()
             return;
         }
 
-        Serial.print("Sending command: ");
-        Serial.println(input);
-
         // Set master to PROCESSING state and track pending command
         currentState = PROCESSING;
         pendingCommand = input;
+
+        Serial.print("Sending command: ");
+        Serial.println(input);
+        
+        if (Serial)
+        {
+            Serial.print("Current State: ");
+            Serial.println("PROCESSING");
+        }
 
         forwardCommand(input);
         lastActivity = millis();
@@ -597,12 +712,11 @@ void handleSerialCommand()
 
 bool validateCommand(String command)
 {
-    // Check basic format: should have exactly 2 commas
+    // Check basic format: should have exactly 2 commas (user input format)
     int firstComma = command.indexOf(',');
     int secondComma = command.indexOf(',', firstComma + 1);
-    int thirdComma = command.indexOf(',', secondComma + 1);
 
-    if (firstComma == -1 || secondComma == -1 || thirdComma != -1)
+    if (firstComma == -1 || secondComma == -1)
     {
         return false;
     }
@@ -712,6 +826,10 @@ void printHelp()
     Serial.println("  help   - Show this help");
     Serial.println("  status - Show device status");
     Serial.println("  reinit - Re-initialize device chain");
+    Serial.println("");
+    Serial.println("Hardware Configuration:");
+    Serial.println("  USB CDC: Only master detection method");
+    Serial.println("  Init Signal: Master wakes slaves via daisy-chain");
     Serial.println("===========================================");
 }
 
@@ -733,6 +851,9 @@ void printDeviceStatus()
         break;
     case INIT_ACTIVE:
         Serial.println("INIT_ACTIVE");
+        break;
+    case WAKEUP:
+        Serial.println("WAKEUP");
         break;
     case READY:
         Serial.println("READY");
