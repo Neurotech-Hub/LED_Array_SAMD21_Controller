@@ -74,17 +74,38 @@ void setup()
     Serial.begin(115200); // USB
     Serial1.begin(9600);  // Device chain
 
-    // Determine if we're master (has USB)
-    delay(2000); // Give USB time to establish
-    isMasterDevice = Serial;
+    // Wait for either Serial (master) or rxReadyPin (slave)
+    while (!isMasterDevice)
+    {
+        if (Serial)
+        {
+            isMasterDevice = true;
+            myDeviceId = 1; // Master is always device 1
+            Serial.println("\nSAMD21 Controller Starting...");
+            Serial.println("VER:" + CODE_VERSION);
+            Serial.println("DEBUG: Setting txReady HIGH to start chain");
+            digitalWrite(txReadyPin, HIGH);
+            break;
+        }
+        if (digitalRead(rxReadyPin) == HIGH)
+        {
+            isMasterDevice = false;
+            break;
+        }
+        digitalWrite(ledPin, (millis() / 500) % 2); // Blink while waiting
+        delay(10);                                  // Small delay to prevent tight loop
+    }
 
+    // Master must wait for rxReady before proceeding
     if (isMasterDevice)
     {
-        Serial.println("\nSAMD21 Controller Starting...");
-        Serial.println("VER:" + CODE_VERSION);
-        Serial.println("DEBUG: Setting txReady HIGH to start chain");
-        digitalWrite(txReadyPin, HIGH);
-        myDeviceId = 1; // Master is always device 1
+        Serial.println("DEBUG: Master waiting for rxReady...");
+        while (digitalRead(rxReadyPin) == LOW)
+        {
+            digitalWrite(ledPin, (millis() / 500) % 2);
+            delay(10);
+        }
+        Serial.println("DEBUG: Chain connected to master!");
     }
 
     // Initial chain connection
