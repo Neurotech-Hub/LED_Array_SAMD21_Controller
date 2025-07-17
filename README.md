@@ -19,26 +19,27 @@ Arduino sketch implementing a daisy-chained round-robin communication system for
 Devices are daisy-chained: Master → Device2 → Device3 → ... → Master
 
 ### Device Roles
-- **Master Device**: USB connected, sends commands via Serial Monitor
+- **Master Device**: USB connected (always device 001), sends commands via Serial Monitor
 - **Slave Devices**: Externally powered, relay and process commands
 
 ### Initialization Process
 1. Device powers up and waits indefinitely for either:
-   - USB Serial connection (becomes Master)
+   - USB Serial connection (becomes Master, ID=001)
    - RX_READY signal (becomes Slave)
 2. Upon role determination:
    - Performs servo sweep (60° → 120° → 90°)
    - User LED active during sweep
 3. Master initiates chain discovery
-4. Brief delay ensures all devices ready
+4. Each slave increments device count for auto-addressing
 
 ### State Machine
-- **INIT_WAITING**: Waiting for initialization command
-- **INIT_ACTIVE**: Processing initialization sequence  
-- **READY**: Ready for commands (master only)
-- **PROCESSING**: Master waiting for command to return
+- **WAITING_FOR_CHAIN**: Waiting for RX_READY to go HIGH
+- **CHAIN_READY**: Normal operation state
+- **INIT_IN_PROGRESS**: Master initializing chain
+- **PROCESSING**: Command in progress
+- **READY**: Ready for next command
 
-## Serial Protocol
+## Command Protocol
 
 ### Message Format
 All messages use prefixed format for easy parsing:
@@ -60,65 +61,24 @@ All messages use prefixed format for easy parsing:
 
 ### Command Format: `deviceId,command,value`
 
-### Three Command Types:
+### Command Types:
 
-#### 1. Initialization: `000,init,XXX`
-- **Special behavior**: Increments XXX and forwards
-- **Master**: Never forwards (except initial startup)
-- **Slaves**: Always increment and forward
-- **Auto-discovery**: Determines total device count
-
-#### 2. Command All Devices: `000,command,value`
-- **All devices**: Process the command
-- **All devices**: Forward until returns to master
-- **Example**: `000,servo,90` - all servos to 90°
-
-#### 3. Single Device: `NNN,command,value`  
-- **Target device only**: Processes command
-- **All devices**: Forward until returns to master
-- **Master**: Enters PROCESSING state until command returns
-- **Example**: `002,servo,90` - only device 2 servo to 90°
-
-## Available Commands
-
-### Device Control
-- `servo,angle` - Set servo angle (60-120 degrees)
-- `dac,value` - Set DAC output (0-1023)
+#### 1. Device Control
+- `xxx,servo,angle` - Set servo angle (60-120 degrees)
+- `xxx,dac,value` - Set DAC output (0-1023)
   - User LED active when DAC > 0
+  - Where xxx is device ID (000=all, 001-n=specific device)
 
-### System Commands  
+#### 2. System Commands
 - `help` - Show command help and version
-- `status` - Show device status
-- `reinit` - Manual re-initialization
-- `dnc` - Execute dance routine
+- `status` - Show system status
 
-### Dance Routine
-The `dnc` command executes a coordinated servo movement sequence:
-1. Initial sequence (all devices):
-   - Move to 60° → 500ms delay
-   - Move to 90° → 500ms delay
-   - Move to 120° → 500ms delay
-2. Random sequence:
-   - 5 random positions (60-120°)
-   - 200ms delay between moves
-3. Features:
-   - Can be interrupted by any serial input
-   - Automatically resets to 90° when complete
-   - Input during dance is discarded
-
-## Error Handling
-
-### Command Validation
-- **Format**: `ERR:FORMAT` - Invalid command format
-- **Device Range**: `ERR:ID_MAX:2` - Device ID out of range
-- **Value Range**: 
-  - `ERR:SERVO_RANGE` - Servo angle not 60-120
-  - `ERR:DAC_RANGE` - DAC value not 0-1023
-
-### System Errors
-- `ERR:BUSY` - System processing another command
-- `ERR:TIMEOUT` - Command round-trip timeout
-- `ERR:NO_DEVICES` - No devices detected
+### Error Messages
+- `ERR:INVALID_FORMAT` - Command format error
+- `ERR:INVALID_DEVICE:n (max:m)` - Device ID out of range
+- `ERR:SERVO_RANGE` - Angle not 60-120
+- `ERR:DAC_RANGE` - Value not 0-1023
+- `ERR:TIMEOUT` - Command timeout
 
 ## Features
 - **Smooth servo control** with speed limiting
@@ -128,7 +88,6 @@ The `dnc` command executes a coordinated servo movement sequence:
 - **Comprehensive error reporting**
 - **Auto-recovery** from chain issues
 - **Hot-swap support** with automatic detection
-- **Coordinated movement** routines (dance)
 
 ## Pin Mapping
 ```
@@ -142,11 +101,21 @@ D5  - SCL
 
 ## Communication Example
 ```
-VER:0.004
-UI:Master started
-UI:Type 'help' or 'status'
+// Device Control
 CMD:002,servo,90
 RCV:002,servo,90
 SRV:2:90
 EOT
+
+// System Command
+help
+UI:Available Commands:
+UI:  Device Control:
+UI:    xxx,servo,angle - Set servo angle (60-120)
+UI:    xxx,dac,value   - Set DAC value (0-1023)
+...
+
+// Error Example
+CMD:003,servo,90
+ERR:INVALID_DEVICE:3 (max:2)
 ``` 

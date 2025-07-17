@@ -49,6 +49,9 @@ void processCommand(String data);
 bool parseCommand(String data, Command &cmd);
 void updateStatusLED();
 void waitForChain();
+void printHelp();
+void printStatus();
+void sendCommandAndWait(String command); // Add function declaration
 
 void setup()
 {
@@ -128,12 +131,22 @@ void loop()
         command.trim();
         if (command.length() > 0)
         {
-            Serial.println("DEBUG: Got USB command: " + command);
+            // Handle system commands directly on master
+            if (command == "help")
+            {
+                printHelp();
+                return;
+            }
+            else if (command == "status")
+            {
+                printStatus();
+                return;
+            }
 
-            // Parse and validate command before sending
+            // Parse and validate regular command
             Command cmd;
             if (!parseCommand(command, cmd))
-            { // Fixed: removed & operator
+            {
                 Serial.println("ERR:INVALID_FORMAT");
                 return;
             }
@@ -368,5 +381,60 @@ void waitForChain()
         Serial.println("DEBUG: Sending initial command: 000,init,001");
         // Send initial device count
         Serial1.println("000,init,001");
+    }
+}
+
+void printHelp()
+{
+    Serial.println("VER:" + CODE_VERSION);
+    Serial.println("UI:Available Commands:");
+    Serial.println("UI:  Device Control:");
+    Serial.println("UI:    xxx,servo,angle - Set servo angle (60-120)");
+    Serial.println("UI:    xxx,dac,value   - Set DAC value (0-1023)");
+    Serial.println("UI:  Where xxx is:");
+    Serial.println("UI:    000 = all devices");
+    Serial.println("UI:    001-" + String(totalDevices) + " = specific device");
+    Serial.println("UI:  System Commands:");
+    Serial.println("UI:    help   - Show this help");
+    Serial.println("UI:    status - Show system status");
+}
+
+void printStatus()
+{
+    Serial.println("VER:" + CODE_VERSION);
+    Serial.println("TOTAL:" + String(totalDevices));
+    Serial.println("STATE:" + String(currentState));
+    if (pendingCommand.length() > 0)
+    {
+        Serial.println("PENDING:" + pendingCommand);
+    }
+}
+
+void sendCommandAndWait(String command)
+{
+    if (!isMasterDevice)
+        return; // Only master can send commands
+
+    // Send the command
+    pendingCommand = command;
+    currentState = PROCESSING;
+    Serial1.println(command);
+    Serial.println("CMD:" + command);
+
+    // Wait for command to complete (return to master)
+    unsigned long startTime = millis();
+    while (currentState == PROCESSING)
+    {
+        // Call loop to handle incoming data
+        loop();
+
+        // Timeout after 2 seconds
+        if (millis() - startTime > 2000)
+        {
+            Serial.println("ERR:TIMEOUT");
+            currentState = READY;
+            pendingCommand = "";
+            break;
+        }
     }
 }
