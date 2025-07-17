@@ -49,6 +49,7 @@ void processCommand(String data);
 bool parseCommand(String data, Command &cmd);
 void updateStatusLED();
 void waitForChain();
+void reinitializeDevices();
 void printHelp();
 void printStatus();
 void sendCommandAndWait(String command); // Add function declaration
@@ -163,12 +164,28 @@ void loop()
                 printStatus();
                 return;
             }
+            else if (command == "reinit")
+            {
+                reinitializeDevices();
+                return;
+            }
 
             // Parse and validate regular command
             Command cmd;
             if (!parseCommand(command, cmd))
             {
                 Serial.println("ERR:INVALID_FORMAT");
+                Serial.println("UI:Use format: deviceId,command,value");
+                Serial.println("UI:Example: 001,servo,90 or 000,dac,512");
+                return;
+            }
+
+            // Validate command type
+            if (cmd.command != "servo" && cmd.command != "dac" && cmd.command != "init")
+            {
+                Serial.println("ERR:INVALID_COMMAND:" + cmd.command);
+                Serial.println("UI:Valid commands: servo, dac");
+                Serial.println("UI:Example: 001,servo,90 or 002,dac,512");
                 return;
             }
 
@@ -178,6 +195,28 @@ void loop()
                 if (cmd.deviceId > totalDevices)
                 {
                     Serial.println("ERR:INVALID_DEVICE:" + String(cmd.deviceId) + " (max:" + String(totalDevices) + ")");
+                    return;
+                }
+            }
+
+            // Validate command values
+            if (cmd.command == "servo")
+            {
+                int angle = cmd.value.toInt();
+                if (angle < 60 || angle > 120)
+                {
+                    Serial.println("ERR:SERVO_RANGE:" + String(angle));
+                    Serial.println("UI:Servo angle must be 60-120 degrees");
+                    return;
+                }
+            }
+            else if (cmd.command == "dac")
+            {
+                int value = cmd.value.toInt();
+                if (value < 0 || value > 1023)
+                {
+                    Serial.println("ERR:DAC_RANGE:" + String(value));
+                    Serial.println("UI:DAC value must be 0-1023");
                     return;
                 }
             }
@@ -405,6 +444,47 @@ void waitForChain()
     }
 }
 
+void reinitializeDevices()
+{
+    if (!isMasterDevice)
+    {
+        Serial.println("ERR:ONLY_MASTER_CAN_REINIT");
+        return;
+    }
+    
+    Serial.println("UI:Restarting device initialization...");
+    
+    // Reset device count and state
+    totalDevices = 0;
+    pendingCommand = "";
+    currentState = INIT_IN_PROGRESS;
+    
+    // Clear any pending Serial1 data
+    Serial1.flush();
+    while (Serial1.available())
+    {
+        Serial1.read();
+    }
+    
+    // Small delay to let slaves settle
+    delay(100);
+    
+    // Check chain connection
+    if (digitalRead(rxReadyPin) == LOW)
+    {
+        Serial.println("ERR:CHAIN_NOT_CONNECTED");
+        Serial.println("UI:Chain not connected - check physical connections");
+        currentState = WAITING_FOR_CHAIN;
+        return;
+    }
+    
+    // Start fresh initialization
+    Serial.println("DEBUG: Starting fresh device initialization");
+    Serial.println("STATE:Initializing");
+    Serial.println("DEBUG: Sending initial command: 000,init,001");
+    Serial1.println("000,init,001");
+}
+
 void printHelp()
 {
     Serial.println("VER:" + CODE_VERSION);
@@ -418,13 +498,39 @@ void printHelp()
     Serial.println("UI:  System Commands:");
     Serial.println("UI:    help   - Show this help");
     Serial.println("UI:    status - Show system status");
+    Serial.println("UI:    reinit - Restart device initialization");
 }
 
 void printStatus()
 {
     Serial.println("VER:" + CODE_VERSION);
     Serial.println("TOTAL:" + String(totalDevices));
-    Serial.println("STATE:" + String(currentState));
+    
+    // Print meaningful state names
+    String stateName;
+    switch (currentState)
+    {
+        case WAITING_FOR_CHAIN:
+            stateName = "Waiting for Chain";
+            break;
+        case CHAIN_READY:
+            stateName = "Ready";
+            break;
+        case INIT_IN_PROGRESS:
+            stateName = "Initializing";
+            break;
+        case PROCESSING:
+            stateName = "Processing";
+            break;
+        case READY:
+            stateName = "Ready";
+            break;
+        default:
+            stateName = "Unknown";
+            break;
+    }
+    Serial.println("STATE:" + stateName);
+    
     if (pendingCommand.length() > 0)
     {
         Serial.println("PENDING:" + pendingCommand);
