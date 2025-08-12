@@ -8,11 +8,11 @@ const String CODE_VERSION = "0.004";
 
 // Pin assignments
 const int dacPin = A0;          // DAC output
-const int pwmPin = D2;          // Servo control
+const int pwmPin = D5;          // Servo control
 const int ledPin = LED_BUILTIN; // Status LED
-const int rxReadyPin = D1;      // Chain ready input
-const int txReadyPin = D3;      // Chain ready output
-const int userLedPin = D10;     // User LED
+const int rxReadyPin = D0;      // Chain ready input
+const int txReadyPin = D1;      // Chain ready output
+const int userLedPin = D2;     // User LED
 // Serial1 uses D6 (TX) and D7 (RX)
 
 // Command structure
