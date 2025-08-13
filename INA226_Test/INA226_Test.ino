@@ -46,7 +46,7 @@ const uint16_t ALERT_POWER_OVER_LIMIT    = 0x0800;  // Power over limit
 const uint16_t ALERT_CONVERSION_READY    = 0x0400;  // Conversion ready flag
 
 // Create INA226 object
-INA226 ina226(0x40);  // Default I2C address (INA226's A0=GND, A1=GND)
+INA226 ina226(0x4A);  // Default I2C address (INA226's A0=GND, A1=GND)
 
 // Create I2C_SCANNER object for professional diagnostics
 I2C_SCANNER scanner;
@@ -55,8 +55,8 @@ I2C_SCANNER scanner;
 const int dacPin = A0;  // DAC output pin
 
 // Calibration parameters for your circuit
-float shuntResistance = 0.039;  // Shunt resistance in ohms (39mΩ)
-float maxCurrent = 5.0;          // Maximum expected current in amps (adjust based on your LED)
+float shuntResistance = 0.04195;  // Shunt resistance in ohms (39mΩ)
+float maxCurrent = 1.5;          // Maximum expected current in amps (adjust based on your LED)
 
 // Measurement variables
 float current = 0.0;
@@ -135,7 +135,7 @@ void loop() {
     handleCommand(command);
   }
   
-  delay(100);
+  delay(10);
 }
 
 // Professional I2C diagnostic function using RobTillaart I2C_SCANNER
@@ -467,7 +467,7 @@ void measureAll() {
   
   shuntVoltage = ina226.getShuntVoltage_mV();
   voltage = ina226.getBusVoltage();
-  current = ina226.getCurrent();
+  current = ina226.getCurrent_mA();
   power = ina226.getPower();
 }
 
@@ -478,7 +478,8 @@ void displayResults() {
   Serial.println("DAC Voltage:    " + String((currentDacValue * 3.3) / 4095.0, 3) + " V");
   Serial.println("Shunt Voltage:  " + String(shuntVoltage, 3) + " mV");
   Serial.println("Bus Voltage:    " + String(voltage, 3) + " V");
-  Serial.println("Current:        " + String(current * 1000, 2) + " mA");
+  // Serial.println("Current:        " + String(current * 1000, 2) + " mA");
+  Serial.println("Current:    " + String(current) + " mA");
   Serial.println("Power:          " + String(power, 3) + " W");
   
   // Check for alerts
