@@ -69,6 +69,22 @@ int currentDacValue = 0;      // Current DAC value (0-4095 for 12-bit)
 int targetDacValue = 0;       // Target DAC value
 bool dacEnabled = false;      // DAC output enabled flag
 
+// Current control variables
+bool currentControlEnabled = false;  // Current control mode enabled
+float targetCurrent = 0.0;          // Target current in mA
+float currentTolerance = 5.0;       // Tolerance in mA (±5mA default)
+float maxCurrentLimit = 1500.0;     // Maximum current limit in mA
+bool currentControlDebug = false;   // Debug output for current control
+
+// Simple current control variables
+bool inAcceptableRange = false;     // Whether current is in acceptable range
+unsigned long lastDacUpdate = 0;    // Last time DAC was updated
+const unsigned long DAC_UPDATE_DELAY = 2000; // 1 second delay between DAC updates
+const unsigned long CURRENT_CHECK_INTERVAL = 100; // Check current every 100ms
+unsigned long lastCurrentCheck = 0; // Last time current was checked
+
+
+
 // Status variables
 bool ina226Initialized = false;
 
@@ -89,6 +105,8 @@ void setup() {
   Serial.println("- MOSFET/Op-Amp triggering");
   Serial.println("- Real-time current measurement");
   Serial.println("- Alert functions and error handling");
+  Serial.println("- PID-based current control (NEW!)");
+  Serial.println("- Real-time DAC adjustment for current regulation");
   
   // Wait for serial connection
   delay(1000);
@@ -111,7 +129,7 @@ void setup() {
     Serial.println("Check I2C connections and address.");
   }
   
-  Serial.println("Commands: measure, dac, calibrate, config, help");
+  Serial.println("Commands: measure, dac, current, calibrate, config, help");
   Serial.println();
 }
 
@@ -119,7 +137,12 @@ void loop() {
   // Update DAC value gradually for smooth transitions
   updateDAC();
   
-  // Automatic measurements disabled - use 'measure' command instead
+  // Current control processing
+  if (currentControlEnabled && ina226Initialized) {
+    updateCurrentControl();
+  }
+  
+  // Automatic current measurements
   // if (millis() - lastMeasurement >= MEASUREMENT_INTERVAL) {
   //   if (ina226Initialized) {
   //     measureAll();
@@ -508,6 +531,94 @@ void updateDAC() {
   }
 }
 
+
+
+// Simple current control function
+void updateCurrentControl() {
+  unsigned long currentTime = millis();
+  
+  // Check current frequently but update DAC slowly
+  if (currentTime - lastCurrentCheck >= CURRENT_CHECK_INTERVAL) {
+    // Take current measurement
+    measureAll();
+    lastCurrentCheck = currentTime;
+    
+    float currentError = targetCurrent - current;
+    float absError = abs(currentError);
+    
+    // Check if current is in acceptable range (±2mA)
+    bool wasInRange = inAcceptableRange;
+    inAcceptableRange = (absError <= 2.0);
+    
+    // Log when entering/exiting acceptable range
+    if (wasInRange != inAcceptableRange && currentControlDebug) {
+      if (inAcceptableRange) {
+        Serial.println("Current entered acceptable range (±2mA)");
+      } else {
+        Serial.println("Current left acceptable range (±2mA)");
+      }
+    }
+    
+    // Only update DAC if enough time has passed and current is not in acceptable range
+    if (currentTime - lastDacUpdate >= DAC_UPDATE_DELAY && !inAcceptableRange) {
+      int dacAdjustment = 0;
+      
+      // Determine DAC adjustment based on current error and current DAC value
+      if (currentDacValue < 1250 && currentError > 0) {
+        // DAC is below 1250 and we need more current: make large increases
+        dacAdjustment = 1250;
+        if (currentControlDebug) {
+          Serial.println("Fast increase to 1250: " + String(dacAdjustment) + " steps");
+        }
+      } else {
+        if (absError > targetCurrent*0.4 || voltage < 4.5) dacAdjustment = (currentError > 0) ? 20 : -40;
+        else if (absError > targetCurrent*0.3) dacAdjustment = (currentError > 0) ? 15 : -30;
+        else if (absError > targetCurrent*0.2) dacAdjustment = (currentError > 0) ? 10 : -20;
+        else if (absError > targetCurrent*0.1) dacAdjustment = (currentError > 0) ?  5 : -10;
+        else if (absError > targetCurrent*0.05) dacAdjustment = (currentError > 0) ? 3 : -5;
+        else if (absError > targetCurrent*0.03) dacAdjustment = (currentError > 0) ? 2 : -3;
+        else if (absError > targetCurrent*0.02) dacAdjustment = (currentError > 0) ? 1 : -2;
+        else dacAdjustment = (currentError > 0) ? 1 : -1;
+        
+        if (currentControlDebug) {
+          Serial.println("Adjustment: " + String(dacAdjustment) + " steps (Error: " + String(currentError, 1) + "mA)");
+        }
+      }
+      
+      // Calculate new DAC value
+      int newDacValue = currentDacValue + dacAdjustment;
+      newDacValue = constrain(newDacValue, 0, 4095);
+      
+      // Update target DAC value
+      targetDacValue = newDacValue;
+      lastDacUpdate = currentTime;
+      
+      if (currentControlDebug) {
+        Serial.print("DAC Update: " + String(currentDacValue) + " -> " + String(newDacValue));
+        Serial.print(" (Target: " + String(targetCurrent, 1) + "mA, Current: " + String(current, 1) + "mA)");
+        Serial.println(" Error: " + String(currentError, 1) + "mA");
+      }
+    }
+    
+    // Safety check: if current exceeds max limit, reduce DAC
+    if (current > maxCurrentLimit) {
+      targetDacValue = 0;
+      currentControlEnabled = false;
+      Serial.println("WARNING: Current exceeded maximum limit! Current control disabled.");
+    }
+    
+    // Debug output (less frequent)
+    static int debugCounter = 0;
+    debugCounter++;
+    if (debugCounter >= 100 && currentControlDebug) {
+      Serial.print("Status: Target=" + String(targetCurrent, 1) + "mA, Current=" + String(current, 1) + "mA, ");
+      Serial.print("Error=" + String(currentError, 1) + "mA, DAC=" + String(currentDacValue) + ", ");
+      Serial.println("InRange=" + String(inAcceptableRange ? "YES" : "NO"));
+      debugCounter = 0;
+    }
+  }
+}
+
 // Handle serial commands
 void handleCommand(String command) {
   command.toLowerCase();
@@ -578,6 +689,15 @@ void handleCommand(String command) {
       Serial.println("Starting continuous measurement mode...");
       Serial.println("Press any key to stop");
       continuousMode();
+    } else {
+      Serial.println("ERROR: INA226 not initialized!");
+    }
+  }
+  else if (command == "current monitor" || command == "monitor") {
+    if (ina226Initialized) {
+      Serial.println("Starting current control monitoring mode...");
+      Serial.println("Press any key to stop");
+      currentMonitorMode();
     } else {
       Serial.println("ERROR: INA226 not initialized!");
     }
@@ -672,6 +792,76 @@ void handleCommand(String command) {
   else if (command == "verify" || command == "v") {
     verifyCurrent();
   }
+  else if (command == "current on") {
+    currentControlEnabled = true;
+    Serial.println("Current control enabled. PID will maintain " + String(targetCurrent, 1) + " mA");
+  }
+  else if (command == "current off") {
+    currentControlEnabled = false;
+    targetDacValue = 0;
+    Serial.println("Current control disabled. DAC set to 0.");
+  }
+  else if (command == "current status") {
+    Serial.println("=== Current Control Status ===");
+    Serial.println("Enabled: " + String(currentControlEnabled ? "Yes" : "No"));
+    Serial.println("Target Current: " + String(targetCurrent, 1) + " mA");
+    Serial.println("Acceptable Range: ±2.0 mA");
+    Serial.println("Max Current Limit: " + String(maxCurrentLimit, 1) + " mA");
+    Serial.println("DAC Update Delay: " + String(DAC_UPDATE_DELAY) + " ms");
+    Serial.println("Current Check Interval: " + String(CURRENT_CHECK_INTERVAL) + " ms");
+    if (ina226Initialized) {
+      Serial.println("Current DAC Value: " + String(currentDacValue));
+      Serial.println("Measured Current: " + String(current, 1) + " mA");
+      float error = current - targetCurrent;
+      Serial.println("Current Error: " + String(error, 1) + " mA");
+      Serial.println("In Acceptable Range: " + String(inAcceptableRange ? "YES" : "NO"));
+    }
+    Serial.println("=============================");
+  }
+  else if (command.startsWith("current ")) {
+    float newCurrent = command.substring(8).toFloat();
+    if (newCurrent >= 0 && newCurrent <= maxCurrentLimit) {
+      targetCurrent = newCurrent;
+      Serial.println("Target current set to: " + String(targetCurrent, 1) + " mA");
+      if (currentControlEnabled) {
+        Serial.println("Current control enabled. Simple control will adjust DAC to maintain " + String(targetCurrent, 1) + " mA");
+      } else {
+        Serial.println("Current control disabled. Use 'current on' to enable control.");
+      }
+    } else if (newCurrent > maxCurrentLimit) {
+      Serial.println("ERROR: Current value exceeds maximum limit of " + String(maxCurrentLimit, 1) + " mA");
+    } else {
+      Serial.println("ERROR: Current value must be positive.");
+    }
+  }
+  else if (command.startsWith("tolerance ")) {
+    float newTolerance = command.substring(10).toFloat();
+    if (newTolerance > 0) {
+      currentTolerance = newTolerance;
+      Serial.println("Current tolerance set to ±" + String(currentTolerance, 1) + " mA");
+    } else {
+      Serial.println("ERROR: Tolerance must be positive");
+    }
+  }
+
+  else if (command == "debug on") {
+    currentControlDebug = true;
+    Serial.println("Current control debug output enabled");
+  }
+  else if (command == "debug off") {
+    currentControlDebug = false;
+    Serial.println("Current control debug output disabled");
+  }
+  else if (command == "current reset") {
+    // Reset current control system
+    currentControlEnabled = false;
+    targetCurrent = 0.0;
+    targetDacValue = 0;
+    inAcceptableRange = false;
+    lastDacUpdate = 0;
+    lastCurrentCheck = 0;
+    Serial.println("Current control system reset");
+  }
   else {
     Serial.println("Unknown command. Type 'help' for available commands.");
   }
@@ -735,7 +925,7 @@ void printHelp() {
   Serial.println("  calibrate, cal    - Recalculate and apply calibration");
   Serial.println("  config, c         - Show current configuration");
   Serial.println("  status            - Show initialization status");
-  Serial.println("  continuous, cont  - Start continuous measurement mode");
+  Serial.println("  continuous, cont  - Start continuous measurement mode (type 'stop' to exit)");
   Serial.println("  reset             - Reset INA226 and recalibrate");
   Serial.println("  shunt <value>     - Set shunt resistance in ohms");
   Serial.println("  maxcurrent <value> - Set maximum current in amps");
@@ -755,11 +945,25 @@ void printHelp() {
   Serial.println("  sweep             - Run DAC sweep test");
   Serial.println("  step              - Run step response test");
   Serial.println();
+  Serial.println("Current Control Commands:");
+  Serial.println("  current <value>   - Set target current in mA (e.g., 'current 50')");
+  Serial.println("  current on        - Enable current control (PID active)");
+  Serial.println("  current off       - Disable current control (DAC fixed)");
+  Serial.println("  current status    - Show current control status");
+  Serial.println("  current reset     - Reset current control system");
+  Serial.println("  current monitor   - Start current control monitoring mode");
+  Serial.println("  tolerance <value> - Set current tolerance in mA");
+  Serial.println("  debug on/off      - Enable/disable current control debug output");
+  Serial.println();
   Serial.println("Examples:");
   Serial.println("  dac 2048          - Set DAC to 50% (1.65V)");
   Serial.println("  dac 1000          - Set DAC to ~25% (0.8V)");
   Serial.println("  shunt 0.039       - Set 39mΩ shunt (your current setup)");
   Serial.println("  maxcurrent 5.0    - Set 5A max current (for high power LED)");
+  Serial.println("  current 50        - Set target current to 50mA");
+  Serial.println("  current on        - Enable simple current control");
+  Serial.println("  current status    - Check current control status");
+  Serial.println("  tolerance 10      - Set tolerance to ±10mA");
   Serial.println("  sweep             - Run current sweep test");
   Serial.println("  alert             - Setup overcurrent protection");
   Serial.println("  ping              - Test I2C communication reliability");
@@ -776,6 +980,10 @@ void printConfiguration() {
   Serial.println("DAC Enabled:        " + String(dacEnabled ? "Yes" : "No"));
   Serial.println("Current DAC Value:  " + String(currentDacValue));
   Serial.println("DAC Voltage:        " + String((currentDacValue * 3.3) / 4095.0, 3) + " V");
+  Serial.println("Current Control:    " + String(currentControlEnabled ? "Enabled" : "Disabled"));
+  Serial.println("Target Current:     " + String(targetCurrent, 1) + " mA");
+  Serial.println("Acceptable Range:   ±2.0 mA");
+  Serial.println("Max Current Limit:  " + String(maxCurrentLimit, 1) + " mA");
   
   if (ina226Initialized) {
     Serial.println("Current LSB:        " + String(ina226.getCurrentLSB_mA(), 6) + " mA");
@@ -808,16 +1016,34 @@ void continuousMode() {
   
   unsigned long startTime = millis();
   int measurementCount = 0;
+  unsigned long lastPrintTime = 0;
+  const unsigned long PRINT_INTERVAL = 500; // Print every 500ms
   
-  while (!Serial.available()) {
-    if (millis() - lastMeasurement >= 500) { // Faster updates
+  Serial.println("Continuous measurement mode started. Type 'stop' to exit.");
+  
+  while (true) {
+    // Check for serial input
+    if (Serial.available()) {
+      String input = Serial.readStringUntil('\n');
+      input.trim();
+      input.toLowerCase();
+      
+      if (input == "stop" || input == "exit" || input == "quit") {
+        break;
+      }
+      // Process other commands while in continuous mode
+      handleCommand(input);
+    }
+    
+    // Take measurements and print at regular intervals
+    if (millis() - lastPrintTime >= PRINT_INTERVAL) {
       measureAll();
       
       // Print compact format
       Serial.print("Time: " + String((millis() - startTime) / 1000.0, 1) + "s | ");
       Serial.print("DAC: " + String(currentDacValue) + " | ");
       Serial.print("V: " + String(voltage, 3) + "V | ");
-      Serial.print("I: " + String(current * 1000, 1) + "mA | ");
+      Serial.print("I: " + String(current, 1) + "mA | ");
       Serial.print("P: " + String(power, 3) + "W");
       
       // Show alerts if any
@@ -826,6 +1052,52 @@ void continuousMode() {
         Serial.print(" | ALERT: 0x" + String(alertFlag, HEX));
       }
       Serial.println();
+      
+      lastPrintTime = millis();
+      measurementCount++;
+    }
+    
+    // Small delay to prevent overwhelming the system
+    delay(10);
+  }
+  
+  Serial.println("Continuous mode stopped. Total measurements: " + String(measurementCount));
+}
+
+// Current control monitoring mode
+void currentMonitorMode() {
+  if (!ina226Initialized) return;
+  
+  unsigned long startTime = millis();
+  int measurementCount = 0;
+  
+  Serial.println("Time(s) | Target(mA) | Current(mA) | Error(mA) | DAC | Status");
+  Serial.println("--------|------------|------------|----------|-----|--------");
+  
+  while (!Serial.available()) {
+    if (millis() - lastMeasurement >= 200) { // Very fast updates for control
+      measureAll();
+      
+      float currentError = current - targetCurrent;
+      String status = "OK";
+      
+      if (abs(currentError) > currentTolerance) {
+        status = "OUT_OF_RANGE";
+      }
+      if (current > maxCurrentLimit) {
+        status = "OVER_LIMIT";
+      }
+      if (!currentControlEnabled) {
+        status = "DISABLED";
+      }
+      
+      // Print monitoring format
+      Serial.print(String((millis() - startTime) / 1000.0, 1) + " | ");
+      Serial.print(String(targetCurrent, 1) + " | ");
+      Serial.print(String(current, 1) + " | ");
+      Serial.print(String(currentError, 1) + " | ");
+      Serial.print(String(currentDacValue) + " | ");
+      Serial.println(status);
       
       lastMeasurement = millis();
       measurementCount++;
@@ -837,7 +1109,7 @@ void continuousMode() {
     Serial.read();
   }
   
-  Serial.println("Continuous mode stopped. Total measurements: " + String(measurementCount));
+  Serial.println("Current monitor stopped. Total measurements: " + String(measurementCount));
 }
 
 // DAC sweep test
